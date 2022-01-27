@@ -1,0 +1,184 @@
+import torch
+import torch.nn as nn
+import data
+from models.conv import GatedConv
+# import models.conv as con
+# import models
+from tqdm import tqdm
+from decoder import GreedyDecoder
+from warpctc_pytorch import CTCLoss
+import torch.nn.functional as F
+import joblib
+from matrix import calc_f1,bleu,distinct
+from save_model import load_model,save_model
+
+
+
+new_word_ad = [w.strip() for w in open('./newword.csv','r',encoding='utf-8').readlines()]
+
+def train(
+    model,
+    start_epoch,
+    learning_rate,
+    epochs=500,
+    batch_size=16,
+    train_index_path="/home/zmw/big_space/zhangmeiwei_space/asr_data/cleaed_data/data_aishell/train.csv",
+    dev_index_path="/home/zmw/big_space/zhangmeiwei_space/asr_data/cleaed_data/data_aishell/dev.csv",
+    test_index_path = "/home/zmw/big_space/zhangmeiwei_space/asr_data/cleaed_data/data_aishell/test.csv",
+    labels_path="./data_aishell/labels.gz",
+    momentum=0.8,
+    max_grad_norm=0.2,
+    weight_decay=0,
+):
+    train_dataset = data.MASRDataset(train_index_path, labels_path)
+    batchs = (len(train_dataset) + batch_size - 1) // batch_size
+    dev_dataset = data.MASRDataset(dev_index_path, labels_path)
+    test_dataset = data.MASRDataset(test_index_path, labels_path)
+    train_dataloader = data.MASRDataLoader(
+        train_dataset, batch_size=batch_size, num_workers=8
+    )
+    train_dataloader_shuffle = data.MASRDataLoader(
+        train_dataset, batch_size=batch_size, num_workers=8, shuffle=True
+    )
+    dev_dataloader = data.MASRDataLoader(
+        dev_dataset, batch_size=batch_size, num_workers=8
+    )
+    test_dataloader = data.MASRDataLoader(
+        test_dataset, batch_size=batch_size, num_workers=8
+    )
+    parameters = model.parameters()
+    optimizer = torch.optim.SGD(
+        parameters,
+        lr=learning_rate,
+        momentum=momentum,
+        nesterov=True,
+        weight_decay=weight_decay,
+    )
+    ctcloss = CTCLoss(size_average=True)
+    # lr_sched = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.985)
+    gstep = 0
+    best_cer = 100000
+    best_cer2 = 100000
+    for epoch in range(start_epoch, epochs):
+        epoch_loss = 0
+        if epoch > 0:
+            train_dataloader = train_dataloader_shuffle
+        for i, (x, y, x_lens, y_lens) in enumerate(train_dataloader):
+            x = x.to("cuda")
+            out, out_lens = model(x, x_lens)
+            out = out.transpose(0, 1).transpose(0, 2)
+            loss = ctcloss(out, y, out_lens, y_lens)
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            # lr_sched.step()
+            epoch_loss += loss.item()
+            # writer.add_scalar("loss/step", loss.item(), gstep)
+            gstep += 1
+            print(
+                "[{}/{}][{}/{}]\tLoss = {}".format(
+                    epoch + 1, epochs, i, int(batchs), loss.item()
+                )
+            )
+        epoch_loss = epoch_loss / batchs
+        cer = eval(model, dev_dataloader,epoch)
+        print("Epoch {}: Loss= {}, CER = {}".format(epoch, epoch_loss, cer))
+        if cer < best_cer:
+            save_model(model,epoch)
+            # torch.save(model, "/home/zmw/big_space/zhangmeiwei_space/asr_res_model/masr/ad/model_best.pth")
+            best_cer = cer
+        if epoch > 30:
+            test_cer = eval_test(model, test_dataloader)
+            if test_cer < best_cer2:
+                best_cer2 = test_cer
+                print("Best CER on Testing is : ", best_cer2)
+
+def eval_test(model,dataloader):
+    model.eval()
+    decoder = GreedyDecoder(dataloader.dataset.labels_str)
+    cer = 0
+    F1data = []
+    predictions = []
+    with torch.no_grad():
+        for i, (x, y, x_lens, y_lens) in tqdm(enumerate(dataloader)):
+            x = x.to("cuda")
+            outs, out_lens = model(x, x_lens)
+            outs = F.softmax(outs, 1)
+            outs = outs.transpose(1, 2)
+            ys = []
+            offset = 0
+            for y_len in y_lens:
+                ys.append(y[offset: offset + y_len])
+                offset += y_len
+            out_strings, out_offsets = decoder.decode(outs, out_lens)
+            y_strings = decoder.convert_to_strings(ys)
+            for pred, truth in zip(out_strings, y_strings):
+                trans, ref = pred[0], truth[0]
+                temp = float(decoder.cer(trans, ref))
+                F1data.append((trans, ref))
+                predictions.append(trans)
+                cer += temp / float(len(ref))
+        cer /= len(dataloader.dataset)
+    f1 = calc_f1(F1data)
+    bleu_1, bleu_2 = bleu(F1data)
+    unigrams_distinct, bigrams_distinct, intra_dist1, intra_dist2 = distinct(predictions)
+    print(f1, bleu_1, bleu_2, unigrams_distinct, bigrams_distinct, intra_dist1, intra_dist2)
+    model.train()
+    print("在测试集上的CER等指标值为： ",cer,f1, bleu_1, bleu_2, unigrams_distinct, bigrams_distinct, intra_dist1, intra_dist2)
+    return cer
+
+
+def eval(model, dataloader,epoch):
+    model.eval()
+    decoder = GreedyDecoder(dataloader.dataset.labels_str)
+    cer = 0
+    F1data = []
+    predictions = []
+    print("decoding")
+    with torch.no_grad():
+        for i, (x, y, x_lens, y_lens) in tqdm(enumerate(dataloader)):
+            x = x.to("cuda")
+            outs, out_lens = model(x, x_lens)
+            outs = F.softmax(outs, 1)
+            outs = outs.transpose(1, 2)
+            ys = []
+            offset = 0
+            for y_len in y_lens:
+                ys.append(y[offset : offset + y_len])
+                offset += y_len
+            out_strings, out_offsets = decoder.decode(outs, out_lens)
+            y_strings = decoder.convert_to_strings(ys)
+            for pred, truth in zip(out_strings, y_strings):
+                trans, ref = pred[0], truth[0]
+                temp = float(decoder.cer(trans, ref))
+                F1data.append((trans, ref))
+                predictions.append(trans)
+                cer += temp / float(len(ref))
+        cer /= len(dataloader.dataset)
+    f1 = calc_f1(F1data)
+    bleu_1, bleu_2 = bleu(F1data)
+    unigrams_distinct, bigrams_distinct, intra_dist1, intra_dist2 = distinct(predictions)
+    print(f1, bleu_1, bleu_2, unigrams_distinct, bigrams_distinct, intra_dist1, intra_dist2)
+    model.train()
+    return cer
+
+
+if __name__ == "__main__":
+    vocabulary = joblib.load('./data_aishell/labels.gz')
+    vocabulary.extend(new_word_ad)
+    vocabulary = "".join(vocabulary)
+    continue_train = True
+    if continue_train:
+        model, epoch = load_model(vocabulary)
+        start_epoch = epoch
+        lr = 0.01
+    else:
+        model = GatedConv(vocabulary)
+        start_epoch = 0
+        lr = 0.6
+    device = torch.device("cuda:4")
+    torch.cuda.set_device(device)
+    model.to(device)
+    print('start_epoch: ',start_epoch)
+    train(model,start_epoch,lr)
